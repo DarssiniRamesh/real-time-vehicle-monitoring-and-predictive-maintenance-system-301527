@@ -5,6 +5,7 @@ from datetime import datetime
 from typing import Any
 
 from src.domain.models import Alert, AlertSeverity, Asset, TelemetryRecord
+from src.schemas.dtos import AlertFilter
 
 
 class StorageAdapter(ABC):
@@ -66,10 +67,38 @@ class StorageAdapter(ABC):
 
     # PUBLIC_INTERFACE
     @abstractmethod
-    def list_alerts(self, asset_id: str | None = None, limit: int = 200) -> list[Alert]:
-        """List alerts, optionally filtered by asset_id."""
+    def list_alerts_filtered(self, flt: AlertFilter) -> tuple[list[Alert], int]:
+        """List alerts using filters, sorting, and pagination.
+
+        Returns:
+            (items, total_count)
+        """
 
     # PUBLIC_INTERFACE
     @abstractmethod
+    def ack_alerts(
+        self,
+        alert_ids: list[str],
+        acked_by: str | None,
+        ack_comment: str | None,
+    ) -> tuple[list[Alert], list[str]]:
+        """Acknowledge one or more alerts.
+
+        Returns:
+            (updated_alerts, not_found_ids)
+        """
+
+    # PUBLIC_INTERFACE
+    def list_alerts(self, asset_id: str | None = None, limit: int = 200) -> list[Alert]:
+        """Legacy wrapper: list alerts optionally by asset_id (no total count)."""
+        flt = AlertFilter(asset_id=asset_id, limit=int(limit), offset=0)
+        items, _total = self.list_alerts_filtered(flt)
+        return items
+
+    # PUBLIC_INTERFACE
     def ack_alert(self, alert_id: str, acked_by: str, ack_comment: str | None) -> Alert | None:
-        """Acknowledge an alert and return updated alert, or None if not found."""
+        """Legacy wrapper: acknowledge a single alert."""
+        updated, not_found = self.ack_alerts([alert_id], acked_by=acked_by, ack_comment=ack_comment)
+        if not_found:
+            return None
+        return updated[0] if updated else None

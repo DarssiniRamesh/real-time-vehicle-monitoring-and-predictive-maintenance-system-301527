@@ -6,7 +6,20 @@ from typing import Any
 from fastapi import Body, FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 
-from src.schemas.dtos import ModelMetadata, PredictionRequest, PredictionResult, TelemetryIngestResponse
+from datetime import datetime
+from fastapi import Query
+
+from src.schemas.dtos import (
+    AlertAckRequest,
+    AlertAckResponse,
+    AlertFilter,
+    AlertListResponse,
+    ModelMetadata,
+    PredictionRequest,
+    PredictionResult,
+    TelemetryIngestResponse,
+)
+from src.services.alerts import acknowledge_alerts, list_alerts
 from src.services.prediction import get_model_metadata, predict_for_asset, predict_from_readings
 from src.services.telemetry_ingest import ingest_telemetry_from_csv_upload, ingest_telemetry_from_json
 from src.storage.adapter import StorageAdapter
@@ -18,6 +31,7 @@ openapi_tags = [
     {"name": "Health", "description": "Service health and operational checks."},
     {"name": "Telemetry", "description": "Telemetry ingestion and time-series record management."},
     {"name": "Prediction", "description": "Baseline rule-based inference and model diagnostics."},
+    {"name": "Alerts", "description": "Alert lifecycle management (list, acknowledge)."},
 ]
 
 
@@ -226,3 +240,157 @@ def model_metadata() -> ModelMetadata:
             extra={"event": "model_metadata_failed", "error_type": type(exc).__name__},
         )
         raise HTTPException(status_code=500, detail="Failed to fetch model metadata.") from exc
+
+
+@app.get(
+    "/api/v1/alerts",
+    tags=["Alerts"],
+    summary="List alerts with filtering, sorting, and pagination",
+    description=(
+        "List alerts from storage with optional filters:\n"
+        "- assetId: filter by asset\n"
+        "- severity: filter by severity (critical/high/medium/low)\n"
+        "- acknowledged: true/false\n"
+        "- from/to: created_at time window (ISO-8601)\n\n"
+        "Supports sorting and pagination and returns `total` count for the query."
+    ),
+    response_model=AlertListResponse,
+    operation_id="list_alerts_api_v1_alerts_get",
+)
+def get_alerts(
+    request: Request,
+    asset_id: str | None = Query(default=None, alias="assetId", description="Filter by asset id."),
+    severity: str | None = Query(
+        default=None,
+        description="Filter by severity: critical, high, medium, low.",
+    ),
+    acknowledged: bool | None = Query(
+        default=None,
+        description="If true, only acknowledged alerts; if false, only unacknowledged; if omitted, all.",
+    ),
+    from_ts: datetime | None = Query(default=None, alias="from", description="Filter created_at >= from (UTC)."),
+    to_ts: datetime | None = Query(default=None, alias="to", description="Filter created_at <= to (UTC)."),
+    sort: str | None = Query(
+        default=None,
+        description="Sort spec: '<field>:<dir>' where field in {created_at,severity,asset_id} and dir in {asc,desc}.",
+    ),
+    offset: int = Query(default=0, ge=0, description="Pagination offset (0-based)."),
+    limit: int = Query(default=50, ge=1, le=500, description="Pagination limit (max 500)."),
+    page: int | None = Query(default=None, ge=1, description="Optional 1-based page number (overrides offset)."),
+) -> AlertListResponse:
+    """List alerts with filtering/sorting/pagination.
+
+    Returns:
+        AlertListResponse: {total, items}
+    """
+    storage = get_storage(app)
+
+    sort_by = "created_at"
+    sort_dir = "desc"
+    if sort:
+        raw = sort.strip()
+        if ":" in raw:
+            sort_by, sort_dir = [p.strip() for p in raw.split(":", 1)]
+        else:
+            sort_by = raw
+
+    # If page is provided, compute offset from (page-1)*limit
+    computed_offset = offset
+    if page is not None:
+        computed_offset = (int(page) - 1) * int(limit)
+
+    try:
+        # Normalize severity into enum via DTO validation (keeps endpoint slim)
+        flt = AlertFilter(
+            asset_id=asset_id,
+            severity=severity,  # type: ignore[arg-type]
+            acknowledged=acknowledged,
+            from_ts=from_ts,
+            to_ts=to_ts,
+            sort_by=sort_by,
+            sort_dir=sort_dir,
+            offset=computed_offset,
+            limit=limit,
+        )
+        resp = list_alerts(storage=storage, flt=flt)
+
+        logger.info(
+            "alerts_list_success",
+            extra={
+                "event": "alerts_list_success",
+                "asset_id": asset_id,
+                "severity": severity,
+                "acknowledged": acknowledged,
+                "from": from_ts.isoformat() if from_ts else None,
+                "to": to_ts.isoformat() if to_ts else None,
+                "sort": sort,
+                "offset": computed_offset,
+                "limit": limit,
+                "returned": len(resp.items),
+                "total": resp.total,
+                "content_type": request.headers.get("content-type"),
+            },
+        )
+        return resp
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception(
+            "alerts_list_failed",
+            extra={
+                "event": "alerts_list_failed",
+                "error_type": type(exc).__name__,
+                "asset_id": asset_id,
+                "severity": severity,
+                "acknowledged": acknowledged,
+            },
+        )
+        raise HTTPException(status_code=400, detail=f"Failed to list alerts: {type(exc).__name__}") from exc
+
+
+@app.post(
+    "/api/v1/alerts/ack",
+    tags=["Alerts"],
+    summary="Acknowledge one or more alerts",
+    description=(
+        "Acknowledge one or more alerts by id. Captures acknowledgement timestamp and optional user/comment.\n\n"
+        "Body: {ids: [...], acked_by?: str, ack_comment?: str}"
+    ),
+    response_model=AlertAckResponse,
+    operation_id="ack_alerts_api_v1_alerts_ack_post",
+)
+def ack_alerts(payload: AlertAckRequest, request: Request) -> AlertAckResponse:
+    """Acknowledge one or more alerts.
+
+    Returns:
+        AlertAckResponse: {updated, not_found}
+    """
+    storage = get_storage(app)
+
+    try:
+        resp = acknowledge_alerts(storage=storage, req=payload)
+        logger.info(
+            "alerts_ack_success",
+            extra={
+                "event": "alerts_ack_success",
+                "ids_len": len(payload.ids),
+                "updated_len": len(resp.updated),
+                "not_found_len": len(resp.not_found),
+                "acked_by": payload.acked_by,
+                "content_type": request.headers.get("content-type"),
+            },
+        )
+        return resp
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception(
+            "alerts_ack_failed",
+            extra={
+                "event": "alerts_ack_failed",
+                "error_type": type(exc).__name__,
+                "ids_len": len(payload.ids) if payload.ids else 0,
+                "content_type": request.headers.get("content-type"),
+            },
+        )
+        raise HTTPException(status_code=400, detail=f"Failed to acknowledge alerts: {type(exc).__name__}") from exc

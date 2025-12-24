@@ -63,15 +63,8 @@ class AlertCreateRequest(BaseModel):
     message: str = Field(..., description="Human-readable alert message.")
 
 
-class AlertAckRequest(BaseModel):
-    """Request DTO for acknowledging an alert."""
-
-    acked_by: str = Field(..., description="Identifier of user/system acknowledging the alert.")
-    ack_comment: str | None = Field(None, description="Optional acknowledgement comment.")
-
-
-class AlertResponse(BaseModel):
-    """Response DTO for an alert."""
+class AlertDTO(BaseModel):
+    """Response DTO for an alert (API-facing)."""
 
     id: str = Field(..., description="Alert identifier.")
     asset_id: str = Field(..., description="Asset identifier the alert is associated with.")
@@ -82,6 +75,58 @@ class AlertResponse(BaseModel):
     acked_at: datetime | None = Field(None, description="UTC timestamp when the alert was acknowledged.")
     acked_by: str | None = Field(None, description="Identifier of user/system that acknowledged the alert.")
     ack_comment: str | None = Field(None, description="Acknowledgement comment, if provided.")
+
+
+class AlertFilter(BaseModel):
+    """Filter DTO for listing alerts.
+
+    This DTO is primarily used by the service layer to keep API/query parsing separate from persistence.
+    """
+
+    asset_id: str | None = Field(None, description="Filter by asset identifier.")
+    severity: AlertSeverity | None = Field(None, description="Filter by severity.")
+    acknowledged: bool | None = Field(
+        None,
+        description="If true, return only acknowledged alerts; if false, return only unacknowledged; if null, all.",
+    )
+    from_ts: datetime | None = Field(None, description="Filter: created_at >= from_ts (UTC).")
+    to_ts: datetime | None = Field(None, description="Filter: created_at <= to_ts (UTC).")
+    sort_by: str = Field(
+        "created_at",
+        description="Sort column. Allowed: created_at, severity, asset_id.",
+    )
+    sort_dir: str = Field(
+        "desc",
+        description="Sort direction. Allowed: asc, desc.",
+    )
+    offset: int = Field(0, ge=0, description="Pagination offset (0-based).")
+    limit: int = Field(50, ge=1, le=500, description="Pagination limit (max 500).")
+
+
+class AlertListResponse(BaseModel):
+    """Response DTO for a paginated list of alerts."""
+
+    total: int = Field(..., ge=0, description="Total number of matching alerts (ignoring pagination).")
+    items: list[AlertDTO] = Field(..., description="Alert items for this page.")
+
+
+class AlertAckRequest(BaseModel):
+    """Request DTO for acknowledging one or more alerts."""
+
+    ids: list[str] = Field(..., min_length=1, description="One or more alert ids to acknowledge.")
+    acked_by: str | None = Field(None, description="Optional identifier of user/system acknowledging the alert.")
+    ack_comment: str | None = Field(None, description="Optional acknowledgement comment.")
+
+
+class AlertAckResponse(BaseModel):
+    """Response DTO for bulk acknowledgement."""
+
+    updated: list[AlertDTO] = Field(..., description="Updated alerts that were acknowledged.")
+    not_found: list[str] = Field(..., description="Alert ids that were not found.")
+
+
+class AlertResponse(AlertDTO):
+    """Response DTO for an alert (legacy name; prefer AlertDTO)."""
 
 
 class PredictionThresholds(BaseModel):

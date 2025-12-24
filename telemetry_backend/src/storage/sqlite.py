@@ -10,6 +10,7 @@ from datetime import datetime, timezone
 from typing import Any, Iterator
 
 from src.domain.models import Alert, AlertSeverity, AlertState, Asset, TelemetryRecord
+from src.schemas.dtos import AlertFilter
 from src.storage.adapter import StorageAdapter
 
 
@@ -59,7 +60,7 @@ class SQLiteStorageAdapter(StorageAdapter):
             conn.close()
 
     def init(self) -> None:
-        """Create required tables if they do not exist."""
+        """Create required tables if they do not exist, and apply lightweight schema upgrades."""
         with self._connect() as conn:
             conn.execute(
                 """
@@ -82,6 +83,8 @@ class SQLiteStorageAdapter(StorageAdapter):
                 );
                 """
             )
+
+            # Alerts table (POC). Includes a derived `acknowledged` column for efficient filtering/indexing.
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS alerts (
@@ -91,6 +94,7 @@ class SQLiteStorageAdapter(StorageAdapter):
                     message TEXT NOT NULL,
                     state TEXT NOT NULL,
                     created_at TEXT NOT NULL,
+                    acknowledged INTEGER NOT NULL DEFAULT 0,
                     acked_at TEXT NULL,
                     acked_by TEXT NULL,
                     ack_comment TEXT NULL,
@@ -98,7 +102,31 @@ class SQLiteStorageAdapter(StorageAdapter):
                 );
                 """
             )
+
+            # Lightweight migration: add `acknowledged` if DB was created with an older schema.
+            cols = {r["name"] for r in conn.execute("PRAGMA table_info(alerts);").fetchall()}
+            if "acknowledged" not in cols:
+                # SQLite supports ADD COLUMN; default value ensures existing rows are treated as unacknowledged.
+                conn.execute("ALTER TABLE alerts ADD COLUMN acknowledged INTEGER NOT NULL DEFAULT 0;")
+
+                # Backfill based on state / acked_at.
+                conn.execute(
+                    """
+                    UPDATE alerts
+                    SET acknowledged = CASE
+                        WHEN state = 'acked' OR acked_at IS NOT NULL THEN 1
+                        ELSE 0
+                    END;
+                    """
+                )
+
+            # Indexes
             conn.execute("CREATE INDEX IF NOT EXISTS idx_telemetry_asset_ts ON telemetry(asset_id, timestamp);")
+
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_alerts_asset_id ON alerts(asset_id);")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_alerts_severity ON alerts(severity);")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_alerts_created_at ON alerts(created_at);")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_alerts_acknowledged ON alerts(acknowledged);")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_alerts_asset_created ON alerts(asset_id, created_at);")
 
     def seed_sample_assets(self) -> list[Asset]:
@@ -231,9 +259,10 @@ class SQLiteStorageAdapter(StorageAdapter):
                 """
                 INSERT INTO alerts (
                     id, asset_id, severity, message, state, created_at,
+                    acknowledged,
                     acked_at, acked_by, ack_comment
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?);
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
                 """,
                 (
                     alert.id,
@@ -242,6 +271,7 @@ class SQLiteStorageAdapter(StorageAdapter):
                     alert.message,
                     alert.state.value,
                     _dt_to_str(alert.created_at),
+                    0,
                     None,
                     None,
                     None,
@@ -249,63 +279,120 @@ class SQLiteStorageAdapter(StorageAdapter):
             )
         return alert
 
-    def list_alerts(self, asset_id: str | None = None, limit: int = 200) -> list[Alert]:
-        if asset_id:
-            sql = """
-                SELECT * FROM alerts
-                WHERE asset_id = ?
-                ORDER BY created_at DESC
-                LIMIT ?;
-            """
-            params: tuple[Any, ...] = (asset_id, int(limit))
-        else:
-            sql = """
-                SELECT * FROM alerts
-                ORDER BY created_at DESC
-                LIMIT ?;
-            """
-            params = (int(limit),)
+    def _row_to_alert(self, r: sqlite3.Row) -> Alert:
+        """Convert a DB row to Alert domain model."""
+        # acked_at may be NULL
+        acked_at = _str_to_dt(r["acked_at"]) if r["acked_at"] else None
+        state_raw = r["state"]
+        state = AlertState(state_raw) if state_raw in {s.value for s in AlertState} else AlertState.OPEN
+
+        return Alert(
+            id=r["id"],
+            asset_id=r["asset_id"],
+            severity=AlertSeverity(r["severity"]),
+            message=r["message"],
+            state=state,
+            created_at=_str_to_dt(r["created_at"]),
+            acked_at=acked_at,
+            acked_by=r["acked_by"],
+            ack_comment=r["ack_comment"],
+        )
+
+    def list_alerts_filtered(self, flt: AlertFilter) -> tuple[list[Alert], int]:
+        # Allowlist sorting to prevent SQL injection through column names.
+        sort_map = {
+            "created_at": "created_at",
+            "severity": "severity",
+            "asset_id": "asset_id",
+        }
+        sort_by = sort_map.get((flt.sort_by or "").strip(), "created_at")
+        sort_dir = (flt.sort_dir or "desc").strip().lower()
+        if sort_dir not in ("asc", "desc"):
+            sort_dir = "desc"
+
+        where: list[str] = []
+        params: list[Any] = []
+
+        if flt.asset_id:
+            where.append("asset_id = ?")
+            params.append(flt.asset_id)
+
+        if flt.severity is not None:
+            where.append("severity = ?")
+            params.append(flt.severity.value)
+
+        if flt.acknowledged is not None:
+            where.append("acknowledged = ?")
+            params.append(1 if flt.acknowledged else 0)
+
+        if flt.from_ts is not None:
+            where.append("created_at >= ?")
+            params.append(_dt_to_str(flt.from_ts))
+
+        if flt.to_ts is not None:
+            where.append("created_at <= ?")
+            params.append(_dt_to_str(flt.to_ts))
+
+        where_sql = ""
+        if where:
+            where_sql = "WHERE " + " AND ".join(where)
+
+        limit = int(flt.limit)
+        offset = int(flt.offset)
+
+        count_sql = f"SELECT COUNT(*) AS cnt FROM alerts {where_sql};"
+        data_sql = f"""
+            SELECT *
+            FROM alerts
+            {where_sql}
+            ORDER BY {sort_by} {sort_dir}
+            LIMIT ? OFFSET ?;
+        """
 
         with self._connect() as conn:
-            rows = conn.execute(sql, params).fetchall()
+            total_row = conn.execute(count_sql, tuple(params)).fetchone()
+            total = int(total_row["cnt"]) if total_row else 0
 
-        def _row_to_alert(r: sqlite3.Row) -> Alert:
-            return Alert(
-                id=r["id"],
-                asset_id=r["asset_id"],
-                severity=AlertSeverity(r["severity"]),
-                message=r["message"],
-                state=AlertState(r["state"]),
-                created_at=_str_to_dt(r["created_at"]),
-                acked_at=_str_to_dt(r["acked_at"]) if r["acked_at"] else None,
-                acked_by=r["acked_by"],
-                ack_comment=r["ack_comment"],
-            )
+            data_params = list(params) + [limit, offset]
+            rows = conn.execute(data_sql, tuple(data_params)).fetchall()
 
-        return [_row_to_alert(r) for r in rows]
+        return ([self._row_to_alert(r) for r in rows], total)
 
-    def ack_alert(self, alert_id: str, acked_by: str, ack_comment: str | None) -> Alert | None:
+    def ack_alerts(
+        self,
+        alert_ids: list[str],
+        acked_by: str | None,
+        ack_comment: str | None,
+    ) -> tuple[list[Alert], list[str]]:
+        if not alert_ids:
+            return ([], [])
+
         now = _utc_now()
-        with self._connect() as conn:
-            row = conn.execute("SELECT * FROM alerts WHERE id = ?;", (alert_id,)).fetchone()
-            if not row:
-                return None
 
-            conn.execute(
-                """
+        placeholders = ",".join(["?"] * len(alert_ids))
+        select_sql = f"SELECT * FROM alerts WHERE id IN ({placeholders});"
+
+        with self._connect() as conn:
+            rows = conn.execute(select_sql, tuple(alert_ids)).fetchall()
+            found_ids = {r["id"] for r in rows}
+            not_found = [i for i in alert_ids if i not in found_ids]
+
+            # Bulk update: mark acknowledged and set ack fields.
+            update_sql = f"""
                 UPDATE alerts
-                SET state = ?, acked_at = ?, acked_by = ?, ack_comment = ?
-                WHERE id = ?;
-                """,
-                (
-                    AlertState.ACKED.value,
-                    _dt_to_str(now),
-                    acked_by,
-                    ack_comment,
-                    alert_id,
-                ),
+                SET state = ?,
+                    acknowledged = 1,
+                    acked_at = ?,
+                    acked_by = ?,
+                    ack_comment = ?
+                WHERE id IN ({placeholders});
+            """
+            conn.execute(
+                update_sql,
+                tuple([AlertState.ACKED.value, _dt_to_str(now), acked_by, ack_comment] + alert_ids),
             )
 
-        # Re-fetch to return canonical state.
-        alerts = [a for a in self.list_alerts(limit=1_000) if a.id == alert_id]
-        return alerts[0] if alerts else None
+            # Re-fetch updated rows to return canonical values.
+            updated_rows = conn.execute(select_sql, tuple([i for i in alert_ids if i in found_ids])).fetchall()
+
+        return ([self._row_to_alert(r) for r in updated_rows], not_found)
