@@ -1,0 +1,4 @@
+{
+    "command": "source venv/bin/activate && pip install -r requirements.txt",
+    "working_directory": "/home/kavia/workspace/code-generation/real-time-vehicle-monitoring-and-predictive-maintenance-system-301527/telemetry_backend"
+}
