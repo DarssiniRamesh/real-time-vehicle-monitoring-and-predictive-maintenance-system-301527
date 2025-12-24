@@ -23,12 +23,18 @@ from src.schemas.dtos import (
     ModelMetadata,
     PredictionRequest,
     PredictionResult,
+    SeedRequest,
+    SeedResponse,
+    SimulationStartRequest,
+    SimulationStatusResponse,
     TelemetryAgg,
     TelemetryIngestResponse,
     TelemetryQueryResponse,
 )
 from src.services.alerts import acknowledge_alerts, list_alerts
 from src.services.prediction import get_model_metadata, predict_for_asset, predict_from_readings
+from src.services.seed import seed_demo_data
+from src.services.simulator import SimulatorState, get_simulator_status, start_simulator, stop_simulator
 from src.services.telemetry_ingest import ingest_telemetry_from_csv_upload, ingest_telemetry_from_json
 from src.services.telemetry_query import get_telemetry_timeseries, list_assets_with_status
 from src.storage.adapter import StorageAdapter
@@ -42,6 +48,8 @@ openapi_tags = [
     {"name": "Telemetry", "description": "Telemetry ingestion and time-series record management."},
     {"name": "Prediction", "description": "Baseline rule-based inference and model diagnostics."},
     {"name": "Alerts", "description": "Alert lifecycle management (list, acknowledge)."},
+    {"name": "Seed", "description": "Demo data generation for end-to-end verification."},
+    {"name": "Simulation", "description": "Background telemetry simulator to generate live demo data and alerts."},
 ]
 
 
@@ -130,10 +138,32 @@ app.add_middleware(
 
 @app.on_event("startup")
 def on_startup() -> None:
-    """FastAPI startup hook: initialize DB connection and seed sample assets."""
+    """FastAPI startup hook: initialize DB connection and seed sample assets.
+
+    Also initializes the telemetry simulator state. If SIM_ENABLED=true, the simulator
+    will auto-start in the background after startup for demo environments.
+    """
     _configure_logging()
     _init_storage(app)
+
+    # Simulator state is stored on app.state; endpoints can start/stop it.
+    app.state.simulator = SimulatorState()
+
     logger.info("startup_complete", extra={"event": "startup_complete"})
+
+    # NOTE: This uses the running event loop (FastAPI/uvicorn) and is safe in async context.
+    # We schedule it without blocking startup.
+    try:
+        # If SIM_ENABLED=true, auto-start the simulator.
+        import asyncio
+
+        storage = get_storage(app)
+        asyncio.get_event_loop().create_task(
+            start_simulator(storage=storage, state=app.state.simulator),
+            name="telemetry_simulator_autostart",
+        )
+    except Exception:
+        logger.exception("sim_autostart_failed", extra={"event": "sim_autostart_failed"})
 
 
 # PUBLIC_INTERFACE
@@ -679,3 +709,124 @@ def ack_alerts(payload: AlertAckRequest, request: Request) -> AlertAckResponse:
         },
     )
     return resp
+
+
+@app.post(
+    "/api/v1/seed",
+    tags=["Seed"],
+    summary="Seed demo assets and telemetry",
+    description=(
+        "Create demo assets (if missing) and generate an initial batch of realistic telemetry for each asset.\n\n"
+        "This endpoint is intended for POC/demo environments and for bootstrapping the frontend with data."
+    ),
+    response_model=SeedResponse,
+    operation_id="seed_demo_api_v1_seed_post",
+    responses={400: {"model": ErrorResponse}, 500: {"model": ErrorResponse}},
+)
+def seed_endpoint(payload: SeedRequest, request: Request) -> SeedResponse:
+    """Seed demo assets and telemetry.
+
+    Sample curl:
+        curl -s -X POST 'http://localhost:3001/api/v1/seed' \
+          -H 'Content-Type: application/json' \
+          -d '{"assets": 6, "points_per_asset": 40, "lookback_minutes": 120}' | jq
+
+    Returns:
+        SeedResponse: {assets_created, telemetry_inserted, asset_ids}
+    """
+    storage = get_storage(app)
+
+    asset_ids, assets_created, telemetry_inserted = seed_demo_data(
+        storage=storage,
+        assets=payload.assets,
+        points_per_asset=payload.points_per_asset,
+        lookback_minutes=payload.lookback_minutes,
+    )
+
+    logger.info(
+        "seed_success",
+        extra={
+            "event": "seed_success",
+            "assets_created": assets_created,
+            "telemetry_inserted": telemetry_inserted,
+            "assets_total": len(asset_ids),
+            "content_type": request.headers.get("content-type"),
+        },
+    )
+
+    return SeedResponse(
+        assets_created=assets_created,
+        telemetry_inserted=telemetry_inserted,
+        asset_ids=asset_ids,
+    )
+
+
+@app.post(
+    "/api/v1/simulate/start",
+    tags=["Simulation"],
+    summary="Start telemetry simulator",
+    description=(
+        "Start a background task that periodically generates telemetry for existing assets and "
+        "creates alerts when predictions indicate high risk.\n\n"
+        "Jittered interval is controlled by SIM_INTERVAL_SECONDS env var (default: 2-5 seconds)."
+    ),
+    response_model=SimulationStatusResponse,
+    operation_id="simulate_start_api_v1_simulate_start_post",
+    responses={400: {"model": ErrorResponse}, 500: {"model": ErrorResponse}},
+)
+async def simulate_start(payload: SimulationStartRequest, request: Request) -> SimulationStatusResponse:
+    """Start the background telemetry simulator.
+
+    Sample curl:
+        curl -s -X POST 'http://localhost:3001/api/v1/simulate/start' \
+          -H 'Content-Type: application/json' \
+          -d '{}' | jq
+
+    Returns:
+        SimulationStatusResponse describing current simulator status.
+    """
+    storage = get_storage(app)
+
+    # Ensure simulator state exists (tests might bypass startup).
+    if getattr(app.state, "simulator", None) is None:
+        app.state.simulator = SimulatorState()
+
+    await start_simulator(storage=storage, state=app.state.simulator, asset_ids=payload.asset_ids)
+
+    status = get_simulator_status(app.state.simulator)
+    logger.info(
+        "sim_start_success",
+        extra={**{"event": "sim_start_success"}, **status, "content_type": request.headers.get("content-type")},
+    )
+    return SimulationStatusResponse(**status)
+
+
+@app.post(
+    "/api/v1/simulate/stop",
+    tags=["Simulation"],
+    summary="Stop telemetry simulator",
+    description="Stop the background telemetry simulator task if it is running.",
+    response_model=SimulationStatusResponse,
+    operation_id="simulate_stop_api_v1_simulate_stop_post",
+    responses={400: {"model": ErrorResponse}, 500: {"model": ErrorResponse}},
+)
+async def simulate_stop(request: Request) -> SimulationStatusResponse:
+    """Stop the background telemetry simulator.
+
+    Sample curl:
+        curl -s -X POST 'http://localhost:3001/api/v1/simulate/stop' | jq
+
+    Returns:
+        SimulationStatusResponse describing current simulator status (running should be false).
+    """
+    if getattr(app.state, "simulator", None) is None:
+        app.state.simulator = SimulatorState()
+
+    await stop_simulator(state=app.state.simulator)
+    status = get_simulator_status(app.state.simulator)
+
+    logger.info(
+        "sim_stop_success",
+        extra={**{"event": "sim_stop_success"}, **status, "content_type": request.headers.get("content-type")},
+    )
+    return SimulationStatusResponse(**status)

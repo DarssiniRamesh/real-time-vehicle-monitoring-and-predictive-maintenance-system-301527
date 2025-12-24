@@ -258,3 +258,52 @@ class ErrorResponse(BaseModel):
         None,
         description="Correlation id for tracing the request. Also returned as X-Request-ID header.",
     )
+
+
+class SeedRequest(BaseModel):
+    """Request DTO for seeding demo assets and telemetry."""
+
+    assets: int = Field(
+        5,
+        ge=1,
+        le=50,
+        description="Number of demo assets to ensure exist (in addition to built-in samples).",
+    )
+    points_per_asset: int = Field(
+        30,
+        ge=1,
+        le=2000,
+        description="How many telemetry points to generate per asset for the initial seed batch.",
+    )
+    lookback_minutes: int = Field(
+        60,
+        ge=1,
+        le=24 * 60,
+        description="How far back in time to spread the seeded points (minutes).",
+    )
+
+
+class SeedResponse(BaseModel):
+    """Response DTO describing what was created during seeding."""
+
+    assets_created: int = Field(..., ge=0, description="Number of assets created (not counting already-existing).")
+    telemetry_inserted: int = Field(..., ge=0, description="Number of telemetry rows inserted.")
+    asset_ids: list[str] = Field(..., description="Asset ids included in the seed operation.")
+
+
+class SimulationStartRequest(BaseModel):
+    """Request DTO for starting the telemetry simulator."""
+
+    asset_ids: list[str] | None = Field(
+        None,
+        description="Optional subset of asset ids to simulate. If omitted, simulates all assets in storage.",
+    )
+
+
+class SimulationStatusResponse(BaseModel):
+    """Response DTO describing current simulator status."""
+
+    running: bool = Field(..., description="Whether the simulator background task is running.")
+    enabled_by_env: bool = Field(..., description="Whether SIM_ENABLED env var is enabled.")
+    interval_seconds_min: float = Field(..., gt=0, description="Minimum jitter interval between ticks, in seconds.")
+    interval_seconds_max: float = Field(..., gt=0, description="Maximum jitter interval between ticks, in seconds.")
