@@ -185,6 +185,54 @@ class SQLiteStorageAdapter(StorageAdapter):
                 for r in rows
             ]
 
+    def get_latest_telemetry_timestamp(self, asset_id: str) -> datetime | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT timestamp
+                FROM telemetry
+                WHERE asset_id = ?
+                ORDER BY timestamp DESC
+                LIMIT 1;
+                """,
+                (asset_id,),
+            ).fetchone()
+            if not row:
+                return None
+            return _str_to_dt(row["timestamp"])
+
+    def query_telemetry_range(
+        self,
+        asset_id: str,
+        start: datetime,
+        end: datetime,
+    ) -> list[dict[str, Any]]:
+        # Use the (asset_id, timestamp) index; order ASC for efficient time-series consumption.
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT id, asset_id, timestamp, readings_json
+                FROM telemetry
+                WHERE asset_id = ?
+                  AND timestamp >= ?
+                  AND timestamp <= ?
+                ORDER BY timestamp ASC;
+                """,
+                (asset_id, _dt_to_str(start), _dt_to_str(end)),
+            ).fetchall()
+
+        out: list[dict[str, Any]] = []
+        for r in rows:
+            out.append(
+                {
+                    "id": int(r["id"]),
+                    "asset_id": r["asset_id"],
+                    "timestamp": _str_to_dt(r["timestamp"]),
+                    "readings": json.loads(r["readings_json"]),
+                }
+            )
+        return out
+
     def insert_telemetry(self, record: TelemetryRecord) -> int:
         with self._connect() as conn:
             cur = conn.execute(

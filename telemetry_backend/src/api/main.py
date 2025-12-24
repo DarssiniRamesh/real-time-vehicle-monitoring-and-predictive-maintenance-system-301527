@@ -14,14 +14,18 @@ from src.schemas.dtos import (
     AlertAckResponse,
     AlertFilter,
     AlertListResponse,
+    AssetListItem,
     ModelMetadata,
     PredictionRequest,
     PredictionResult,
+    TelemetryAgg,
     TelemetryIngestResponse,
+    TelemetryQueryResponse,
 )
 from src.services.alerts import acknowledge_alerts, list_alerts
 from src.services.prediction import get_model_metadata, predict_for_asset, predict_from_readings
 from src.services.telemetry_ingest import ingest_telemetry_from_csv_upload, ingest_telemetry_from_json
+from src.services.telemetry_query import get_telemetry_timeseries, list_assets_with_status
 from src.storage.adapter import StorageAdapter
 from src.storage.factory import create_storage_adapter
 
@@ -29,6 +33,7 @@ logger = logging.getLogger("telemetry_backend")
 
 openapi_tags = [
     {"name": "Health", "description": "Service health and operational checks."},
+    {"name": "Assets", "description": "Asset inventory and status listing."},
     {"name": "Telemetry", "description": "Telemetry ingestion and time-series record management."},
     {"name": "Prediction", "description": "Baseline rule-based inference and model diagnostics."},
     {"name": "Alerts", "description": "Alert lifecycle management (list, acknowledge)."},
@@ -80,6 +85,47 @@ def get_storage(app_: FastAPI) -> StorageAdapter:
 def health_check() -> dict:
     """Return a basic health response."""
     return {"message": "Healthy"}
+
+
+@app.get(
+    "/api/v1/assets",
+    tags=["Assets"],
+    summary="List available assets",
+    description="List available assets (id, name, type) with a simple ACTIVE/INACTIVE status.",
+    response_model=list[AssetListItem],
+    operation_id="list_assets_api_v1_assets_get",
+)
+def list_assets(request: Request) -> list[AssetListItem]:
+    """List all assets known to the system.
+
+    Status heuristic (POC):
+    - active: telemetry seen within the last 60 minutes
+    - inactive: otherwise
+
+    Sample curl:
+        curl -s 'http://localhost:3001/api/v1/assets' | jq
+
+    Returns:
+        List[AssetListItem]
+    """
+    storage = get_storage(app)
+    try:
+        items = list_assets_with_status(storage)
+        logger.info(
+            "assets_list_success",
+            extra={
+                "event": "assets_list_success",
+                "count": len(items),
+                "content_type": request.headers.get("content-type"),
+            },
+        )
+        return items
+    except Exception as exc:
+        logger.exception(
+            "assets_list_failed",
+            extra={"event": "assets_list_failed", "error_type": type(exc).__name__},
+        )
+        raise HTTPException(status_code=500, detail="Failed to list assets.") from exc
 
 
 @app.post(
@@ -149,6 +195,88 @@ def ingest_telemetry(
             },
         )
         raise HTTPException(status_code=400, detail=f"Failed to ingest telemetry: {type(exc).__name__}") from exc
+
+
+@app.get(
+    "/api/v1/telemetry",
+    tags=["Telemetry"],
+    summary="Retrieve telemetry time-series (raw or aggregated)",
+    description=(
+        "Retrieve telemetry points for an asset within a time range.\n\n"
+        "Query parameters:\n"
+        "- assetId: asset identifier\n"
+        "- from/to: ISO-8601 timestamps\n"
+        "- agg: one of none|min|max|avg|p50|p90\n"
+        "- interval: bucket size in seconds (required when agg != none)\n\n"
+        "Response is a flattened list of points: (timestamp, key, value)."
+    ),
+    response_model=TelemetryQueryResponse,
+    operation_id="get_telemetry_api_v1_telemetry_get",
+)
+def get_telemetry(
+    request: Request,
+    asset_id: str = Query(..., alias="assetId", description="Asset identifier."),
+    from_ts: datetime = Query(..., alias="from", description="Start of time window (UTC)."),
+    to_ts: datetime = Query(..., alias="to", description="End of time window (UTC)."),
+    agg: TelemetryAgg = Query(
+        default=TelemetryAgg.NONE,
+        description="Aggregation function: none|min|max|avg|p50|p90.",
+    ),
+    interval: int | None = Query(
+        default=None,
+        ge=1,
+        description="Bucket interval in seconds; required when agg is not 'none'.",
+    ),
+) -> TelemetryQueryResponse:
+    """Retrieve raw or aggregated telemetry for charting.
+
+    Sample curl (raw points):
+        curl -s \\
+          'http://localhost:3001/api/v1/telemetry?assetId=ASSET-TRUCK-001&from=2025-01-01T00:00:00Z&to=2025-01-01T01:00:00Z&agg=none' | jq
+
+    Sample curl (aggregated avg per 60s bucket):
+        curl -s \\
+          'http://localhost:3001/api/v1/telemetry?assetId=ASSET-TRUCK-001&from=2025-01-01T00:00:00Z&to=2025-01-01T01:00:00Z&agg=avg&interval=60' | jq
+
+    Returns:
+        TelemetryQueryResponse: {asset_id, from, to, agg, interval, points}
+    """
+    storage = get_storage(app)
+    try:
+        resp = get_telemetry_timeseries(
+            storage=storage,
+            asset_id=asset_id,
+            from_ts=from_ts,
+            to_ts=to_ts,
+            agg=agg,
+            interval_s=interval,
+        )
+        logger.info(
+            "telemetry_get_success",
+            extra={
+                "event": "telemetry_get_success",
+                "asset_id": asset_id,
+                "from": from_ts.isoformat(),
+                "to": to_ts.isoformat(),
+                "agg": agg.value,
+                "interval": interval,
+                "points": len(resp.points),
+                "content_type": request.headers.get("content-type"),
+            },
+        )
+        return resp
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception(
+            "telemetry_get_failed",
+            extra={
+                "event": "telemetry_get_failed",
+                "asset_id": asset_id,
+                "error_type": type(exc).__name__,
+            },
+        )
+        raise HTTPException(status_code=400, detail=f"Failed to retrieve telemetry: {type(exc).__name__}") from exc
 
 
 @app.post(

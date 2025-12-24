@@ -42,6 +42,25 @@ class StorageAdapter(ABC):
 
     # PUBLIC_INTERFACE
     @abstractmethod
+    def get_latest_telemetry_timestamp(self, asset_id: str) -> datetime | None:
+        """Return the most recent telemetry timestamp for an asset, or None if none exists."""
+
+    # PUBLIC_INTERFACE
+    @abstractmethod
+    def query_telemetry_range(
+        self,
+        asset_id: str,
+        start: datetime,
+        end: datetime,
+    ) -> list[dict[str, Any]]:
+        """Query telemetry records for an asset within [start,end] (UTC) ordered by timestamp ASC.
+
+        Returns dicts shaped like TelemetryRecordResponse fields:
+        {id, timestamp, asset_id, readings}
+        """
+
+    # PUBLIC_INTERFACE
+    @abstractmethod
     def insert_telemetry(self, record: TelemetryRecord) -> int:
         """Insert a telemetry record and return its database id."""
 

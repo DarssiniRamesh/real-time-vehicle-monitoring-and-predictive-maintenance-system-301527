@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+from enum import Enum
 from typing import Any
 
 from pydantic import BaseModel, Field
@@ -25,6 +26,22 @@ class AssetResponse(BaseModel):
     created_at: datetime = Field(..., description="UTC timestamp when the asset was created.")
 
 
+class AssetStatus(str, Enum):
+    """Operational status of an asset for dashboard list views (POC heuristic)."""
+
+    ACTIVE = "active"
+    INACTIVE = "inactive"
+
+
+class AssetListItem(BaseModel):
+    """Response DTO for listing assets (minimal fields + status)."""
+
+    id: str = Field(..., description="Unique asset identifier.")
+    name: str = Field(..., description="Human-readable asset name.")
+    type: str = Field(..., description="Asset type/category.")
+    status: AssetStatus = Field(..., description="Heuristic status: active if telemetry seen recently, else inactive.")
+
+
 class TelemetryIngestRequest(BaseModel):
     """Request DTO for ingesting telemetry for an asset."""
 
@@ -43,6 +60,38 @@ class TelemetryRecordResponse(BaseModel):
     timestamp: datetime = Field(..., description="Telemetry timestamp (UTC).")
     asset_id: str = Field(..., description="Asset identifier the telemetry belongs to.")
     readings: dict[str, Any] = Field(..., description="Sensor readings payload.")
+
+
+class TelemetryAgg(str, Enum):
+    """Aggregation function for time-series bucketing."""
+
+    NONE = "none"
+    MIN = "min"
+    MAX = "max"
+    AVG = "avg"
+    P50 = "p50"
+    P90 = "p90"
+
+
+class TelemetryPoint(BaseModel):
+    """A single (possibly aggregated) telemetry point for charting."""
+
+    timestamp: datetime = Field(..., description="Point timestamp (UTC). For aggregates this is the bucket start time.")
+    key: str = Field(..., description="Metric key (sensor name).")
+    value: float = Field(..., description="Numeric value (raw or aggregated).")
+
+
+class TelemetryQueryResponse(BaseModel):
+    """Response DTO for telemetry time-series retrieval."""
+
+    asset_id: str = Field(..., description="Asset identifier.")
+    from_ts: datetime = Field(..., alias="from", description="Query window start (UTC, inclusive).")
+    to_ts: datetime = Field(..., alias="to", description="Query window end (UTC, inclusive).")
+    agg: TelemetryAgg = Field(..., description="Aggregation function applied.")
+    interval: int | None = Field(None, ge=1, description="Bucket interval in seconds when agg != none.")
+    points: list[TelemetryPoint] = Field(..., description="Flattened time-series points (timestamp, key, value).")
+
+    model_config = {"populate_by_name": True}
 
 
 class TelemetryIngestResponse(BaseModel):
