@@ -1,20 +1,25 @@
 from __future__ import annotations
 
 import logging
+import os
+import time
+import uuid
+from datetime import datetime
 from typing import Any
 
-from fastapi import Body, FastAPI, File, HTTPException, Request, UploadFile
+from fastapi import Body, FastAPI, File, HTTPException, Query, Request, UploadFile
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
-
-from datetime import datetime
-from fastapi import Query
+from fastapi.responses import JSONResponse
 
 from src.schemas.dtos import (
     AlertAckRequest,
     AlertAckResponse,
     AlertFilter,
     AlertListResponse,
+    APIError,
     AssetListItem,
+    ErrorResponse,
     ModelMetadata,
     PredictionRequest,
     PredictionResult,
@@ -40,12 +45,62 @@ openapi_tags = [
 ]
 
 
+def _configure_logging() -> None:
+    """Configure baseline logging if the app is launched without a logging config.
+
+    Uses simple key=value output so downstream log shippers can parse it easily.
+    """
+    root = logging.getLogger()
+    if root.handlers:
+        return
+
+    level_name = os.getenv("LOG_LEVEL", "INFO").upper().strip()
+    level = getattr(logging, level_name, logging.INFO)
+
+    logging.basicConfig(
+        level=level,
+        format="ts=%(asctime)s level=%(levelname)s logger=%(name)s msg=%(message)s",
+    )
+
+
+def _parse_cors_origins(raw: str | None) -> list[str]:
+    """Parse comma-separated CORS origins env var into a list."""
+    if raw is None:
+        return []
+    parts = [p.strip() for p in raw.split(",")]
+    return [p for p in parts if p]
+
+
 def _init_storage(app: FastAPI) -> None:
     """Initialize embedded storage and attach it to app.state."""
     storage = create_storage_adapter()
     storage.init()
     storage.seed_sample_assets()
     app.state.storage = storage
+
+
+def _get_or_create_request_id(request: Request) -> str:
+    """Return request id from header if present, else generate a new one."""
+    rid = request.headers.get("x-request-id")
+    if rid and rid.strip():
+        return rid.strip()
+    return str(uuid.uuid4())
+
+
+def _error_response(
+    *,
+    code: str,
+    message: str,
+    status_code: int,
+    request_id: str | None,
+    details: Any | None = None,
+) -> ErrorResponse:
+    """Build the standardized ErrorResponse DTO."""
+    return ErrorResponse(
+        error=APIError(code=code, message=message, details=details),
+        status_code=int(status_code),
+        request_id=request_id,
+    )
 
 
 app = FastAPI(
@@ -55,9 +110,18 @@ app = FastAPI(
     openapi_tags=openapi_tags,
 )
 
+# ---- CORS ----
+# Goal: be permissive for local development (React dev server at http://localhost:3000),
+# while also supporting credentialed requests. We use allow_origin_regex so that the
+# middleware echoes the request Origin (instead of '*'), which works with credentials.
+default_origins = ["http://localhost:3000", "http://127.0.0.1:3000"]
+cors_allow_origins = _parse_cors_origins(os.getenv("CORS_ALLOW_ORIGINS")) or default_origins
+cors_allow_origin_regex = os.getenv("CORS_ALLOW_ORIGIN_REGEX", ".*")
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=cors_allow_origins,
+    allow_origin_regex=cors_allow_origin_regex,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -67,7 +131,9 @@ app.add_middleware(
 @app.on_event("startup")
 def on_startup() -> None:
     """FastAPI startup hook: initialize DB connection and seed sample assets."""
+    _configure_logging()
     _init_storage(app)
+    logger.info("startup_complete", extra={"event": "startup_complete"})
 
 
 # PUBLIC_INTERFACE
@@ -81,10 +147,177 @@ def get_storage(app_: FastAPI) -> StorageAdapter:
     return storage
 
 
-@app.get("/", tags=["Health"], summary="Health Check", description="Simple service health check endpoint.")
+@app.middleware("http")
+async def request_logging_middleware(request: Request, call_next):
+    """Log request/response summary with a correlation id.
+
+    - Adds/propagates X-Request-ID header.
+    - Emits one log line at end of request with method/path/status/duration.
+    """
+    request_id = _get_or_create_request_id(request)
+    start = time.perf_counter()
+
+    try:
+        response = await call_next(request)
+    except Exception:
+        # Exception handlers will format the response; we still want a log.
+        duration_ms = int((time.perf_counter() - start) * 1000)
+        logger.exception(
+            "request_unhandled_exception",
+            extra={
+                "event": "request_unhandled_exception",
+                "request_id": request_id,
+                "method": request.method,
+                "path": request.url.path,
+                "query": str(request.url.query),
+                "duration_ms": duration_ms,
+                "client": request.client.host if request.client else None,
+            },
+        )
+        raise
+
+    duration_ms = int((time.perf_counter() - start) * 1000)
+    logger.info(
+        "request_complete",
+        extra={
+            "event": "request_complete",
+            "request_id": request_id,
+            "method": request.method,
+            "path": request.url.path,
+            "query": str(request.url.query),
+            "status_code": response.status_code,
+            "duration_ms": duration_ms,
+            "client": request.client.host if request.client else None,
+        },
+    )
+
+    response.headers["X-Request-ID"] = request_id
+    return response
+
+
+@app.exception_handler(HTTPException)
+async def http_exception_handler(request: Request, exc: HTTPException) -> JSONResponse:
+    """Return standardized error payload for HTTPException."""
+    request_id = _get_or_create_request_id(request)
+
+    details = None
+    message = "Request failed."
+    if isinstance(exc.detail, str):
+        message = exc.detail
+    else:
+        # Some internal services raise dict detail (e.g., validation errors).
+        details = exc.detail
+        if isinstance(details, dict) and isinstance(details.get("message"), str):
+            message = details["message"]
+
+    logger.info(
+        "http_exception",
+        extra={
+            "event": "http_exception",
+            "request_id": request_id,
+            "status_code": exc.status_code,
+            "path": request.url.path,
+            "error_detail_type": type(exc.detail).__name__,
+        },
+    )
+
+    payload = _error_response(
+        code="http_exception",
+        message=message,
+        status_code=exc.status_code,
+        request_id=request_id,
+        details=details,
+    )
+    return JSONResponse(status_code=exc.status_code, content=payload.model_dump())
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError) -> JSONResponse:
+    """Return standardized error payload for request validation errors (422)."""
+    request_id = _get_or_create_request_id(request)
+    details = {"errors": exc.errors()}
+
+    logger.info(
+        "request_validation_error",
+        extra={
+            "event": "request_validation_error",
+            "request_id": request_id,
+            "path": request.url.path,
+            "errors_len": len(exc.errors() or []),
+        },
+    )
+
+    payload = _error_response(
+        code="validation_error",
+        message="Validation failed",
+        status_code=422,
+        request_id=request_id,
+        details=details,
+    )
+    return JSONResponse(status_code=422, content=payload.model_dump())
+
+
+@app.exception_handler(Exception)
+async def unhandled_exception_handler(request: Request, exc: Exception) -> JSONResponse:
+    """Return standardized error payload for unhandled exceptions (500)."""
+    request_id = _get_or_create_request_id(request)
+
+    logger.exception(
+        "unhandled_exception",
+        extra={
+            "event": "unhandled_exception",
+            "request_id": request_id,
+            "path": request.url.path,
+            "error_type": type(exc).__name__,
+        },
+    )
+
+    payload = _error_response(
+        code="internal_error",
+        message="Internal server error",
+        status_code=500,
+        request_id=request_id,
+        details={"error_type": type(exc).__name__},
+    )
+    return JSONResponse(status_code=500, content=payload.model_dump())
+
+
+@app.get(
+    "/",
+    tags=["Health"],
+    summary="Health Check",
+    description="Simple service health check endpoint.",
+    responses={200: {"description": "Service is healthy"}, 500: {"model": ErrorResponse}},
+)
 def health_check() -> dict:
     """Return a basic health response."""
     return {"message": "Healthy"}
+
+
+@app.get(
+    "/health",
+    tags=["Health"],
+    summary="Health Check (extended)",
+    description="Extended health endpoint including API version and status.",
+    operation_id="health_check_extended__get",
+    responses={200: {"description": "Service is healthy"}, 500: {"model": ErrorResponse}},
+)
+def health_check_extended() -> dict:
+    """Return health status for readiness/liveness checks."""
+    return {"status": "ok", "service": "telemetry_backend", "version": app.version}
+
+
+@app.get(
+    "/api/v1/health",
+    tags=["Health"],
+    summary="API Health Check",
+    description="Versioned health endpoint for clients/proxies expecting /api/v1 prefix.",
+    operation_id="health_check_api_v1__get",
+    responses={200: {"description": "Service is healthy"}, 500: {"model": ErrorResponse}},
+)
+def health_check_v1() -> dict:
+    """Return health status under /api/v1 namespace."""
+    return {"status": "ok"}
 
 
 @app.get(
@@ -94,6 +327,7 @@ def health_check() -> dict:
     description="List available assets (id, name, type) with a simple ACTIVE/INACTIVE status.",
     response_model=list[AssetListItem],
     operation_id="list_assets_api_v1_assets_get",
+    responses={400: {"model": ErrorResponse}, 500: {"model": ErrorResponse}},
 )
 def list_assets(request: Request) -> list[AssetListItem]:
     """List all assets known to the system.
@@ -109,23 +343,16 @@ def list_assets(request: Request) -> list[AssetListItem]:
         List[AssetListItem]
     """
     storage = get_storage(app)
-    try:
-        items = list_assets_with_status(storage)
-        logger.info(
-            "assets_list_success",
-            extra={
-                "event": "assets_list_success",
-                "count": len(items),
-                "content_type": request.headers.get("content-type"),
-            },
-        )
-        return items
-    except Exception as exc:
-        logger.exception(
-            "assets_list_failed",
-            extra={"event": "assets_list_failed", "error_type": type(exc).__name__},
-        )
-        raise HTTPException(status_code=500, detail="Failed to list assets.") from exc
+    items = list_assets_with_status(storage)
+    logger.info(
+        "assets_list_success",
+        extra={
+            "event": "assets_list_success",
+            "count": len(items),
+            "content_type": request.headers.get("content-type"),
+        },
+    )
+    return items
 
 
 @app.post(
@@ -143,6 +370,7 @@ def list_assets(request: Request) -> list[AssetListItem]:
     ),
     response_model=TelemetryIngestResponse,
     operation_id="ingest_telemetry_api_v1_telemetry_post",
+    responses={400: {"model": ErrorResponse}, 404: {"model": ErrorResponse}, 500: {"model": ErrorResponse}},
 )
 def ingest_telemetry(
     request: Request,
@@ -164,37 +392,23 @@ def ingest_telemetry(
     """
     storage = get_storage(app)
 
-    try:
-        if file is not None:
-            result = ingest_telemetry_from_csv_upload(storage=storage, upload=file)
-        else:
-            if payload is None:
-                raise HTTPException(status_code=400, detail="Missing request body (JSON) or file upload (CSV).")
-            result = ingest_telemetry_from_json(storage=storage, payload=payload)
+    if file is not None:
+        result = ingest_telemetry_from_csv_upload(storage=storage, upload=file)
+    else:
+        if payload is None:
+            raise HTTPException(status_code=400, detail="Missing request body (JSON) or file upload (CSV).")
+        result = ingest_telemetry_from_json(storage=storage, payload=payload)
 
-        logger.info(
-            "telemetry_ingest_success",
-            extra={
-                "event": "telemetry_ingest_success",
-                "count": result.count,
-                "ids_len": len(result.ids),
-                "content_type": request.headers.get("content-type"),
-            },
-        )
-        return result
-    except HTTPException:
-        # Let explicit HTTP errors pass through.
-        raise
-    except Exception as exc:
-        logger.exception(
-            "telemetry_ingest_failed",
-            extra={
-                "event": "telemetry_ingest_failed",
-                "content_type": request.headers.get("content-type"),
-                "error_type": type(exc).__name__,
-            },
-        )
-        raise HTTPException(status_code=400, detail=f"Failed to ingest telemetry: {type(exc).__name__}") from exc
+    logger.info(
+        "telemetry_ingest_success",
+        extra={
+            "event": "telemetry_ingest_success",
+            "count": result.count,
+            "ids_len": len(result.ids),
+            "content_type": request.headers.get("content-type"),
+        },
+    )
+    return result
 
 
 @app.get(
@@ -212,6 +426,7 @@ def ingest_telemetry(
     ),
     response_model=TelemetryQueryResponse,
     operation_id="get_telemetry_api_v1_telemetry_get",
+    responses={400: {"model": ErrorResponse}, 404: {"model": ErrorResponse}, 500: {"model": ErrorResponse}},
 )
 def get_telemetry(
     request: Request,
@@ -231,52 +446,39 @@ def get_telemetry(
     """Retrieve raw or aggregated telemetry for charting.
 
     Sample curl (raw points):
-        curl -s \\
+        curl -s \
           'http://localhost:3001/api/v1/telemetry?assetId=ASSET-TRUCK-001&from=2025-01-01T00:00:00Z&to=2025-01-01T01:00:00Z&agg=none' | jq
 
     Sample curl (aggregated avg per 60s bucket):
-        curl -s \\
+        curl -s \
           'http://localhost:3001/api/v1/telemetry?assetId=ASSET-TRUCK-001&from=2025-01-01T00:00:00Z&to=2025-01-01T01:00:00Z&agg=avg&interval=60' | jq
 
     Returns:
         TelemetryQueryResponse: {asset_id, from, to, agg, interval, points}
     """
     storage = get_storage(app)
-    try:
-        resp = get_telemetry_timeseries(
-            storage=storage,
-            asset_id=asset_id,
-            from_ts=from_ts,
-            to_ts=to_ts,
-            agg=agg,
-            interval_s=interval,
-        )
-        logger.info(
-            "telemetry_get_success",
-            extra={
-                "event": "telemetry_get_success",
-                "asset_id": asset_id,
-                "from": from_ts.isoformat(),
-                "to": to_ts.isoformat(),
-                "agg": agg.value,
-                "interval": interval,
-                "points": len(resp.points),
-                "content_type": request.headers.get("content-type"),
-            },
-        )
-        return resp
-    except HTTPException:
-        raise
-    except Exception as exc:
-        logger.exception(
-            "telemetry_get_failed",
-            extra={
-                "event": "telemetry_get_failed",
-                "asset_id": asset_id,
-                "error_type": type(exc).__name__,
-            },
-        )
-        raise HTTPException(status_code=400, detail=f"Failed to retrieve telemetry: {type(exc).__name__}") from exc
+    resp = get_telemetry_timeseries(
+        storage=storage,
+        asset_id=asset_id,
+        from_ts=from_ts,
+        to_ts=to_ts,
+        agg=agg,
+        interval_s=interval,
+    )
+    logger.info(
+        "telemetry_get_success",
+        extra={
+            "event": "telemetry_get_success",
+            "asset_id": asset_id,
+            "from": from_ts.isoformat(),
+            "to": to_ts.isoformat(),
+            "agg": agg.value,
+            "interval": interval,
+            "points": len(resp.points),
+            "content_type": request.headers.get("content-type"),
+        },
+    )
+    return resp
 
 
 @app.post(
@@ -292,6 +494,7 @@ def get_telemetry(
     ),
     response_model=PredictionResult,
     operation_id="predict_api_v1_predict_post",
+    responses={400: {"model": ErrorResponse}, 404: {"model": ErrorResponse}, 500: {"model": ErrorResponse}},
 )
 def predict(payload: PredictionRequest, request: Request) -> PredictionResult:
     """Run baseline rule-based inference.
@@ -305,45 +508,32 @@ def predict(payload: PredictionRequest, request: Request) -> PredictionResult:
     """
     storage = get_storage(app)
 
-    try:
-        if payload.readings is not None:
-            if payload.asset_id is None or payload.asset_id.strip() == "":
-                raise HTTPException(status_code=400, detail="asset_id is required when readings are provided.")
-            if not isinstance(payload.readings, dict) or len(payload.readings) == 0:
-                raise HTTPException(status_code=400, detail="readings must be a non-empty object.")
-            result = predict_from_readings(asset_id=payload.asset_id, readings=payload.readings)
-            # preserve provided timestamp if present
-            if payload.timestamp is not None:
-                result.used_timestamp = payload.timestamp  # type: ignore[attr-defined]
-        else:
-            if payload.asset_id is None or payload.asset_id.strip() == "":
-                raise HTTPException(status_code=400, detail="Provide either readings or asset_id.")
-            result = predict_for_asset(storage=storage, asset_id=payload.asset_id)
+    if payload.readings is not None:
+        if payload.asset_id is None or payload.asset_id.strip() == "":
+            raise HTTPException(status_code=400, detail="asset_id is required when readings are provided.")
+        if not isinstance(payload.readings, dict) or len(payload.readings) == 0:
+            raise HTTPException(status_code=400, detail="readings must be a non-empty object.")
+        result = predict_from_readings(asset_id=payload.asset_id, readings=payload.readings)
+        # Preserve provided timestamp if present
+        if payload.timestamp is not None:
+            result.used_timestamp = payload.timestamp  # type: ignore[attr-defined]
+    else:
+        if payload.asset_id is None or payload.asset_id.strip() == "":
+            raise HTTPException(status_code=400, detail="Provide either readings or asset_id.")
+        result = predict_for_asset(storage=storage, asset_id=payload.asset_id)
 
-        logger.info(
-            "prediction_success",
-            extra={
-                "event": "prediction_success",
-                "asset_id": result.asset_id,
-                "risk_score": result.risk_score,
-                "severity": result.severity,
-                "content_type": request.headers.get("content-type"),
-                "used_timestamp": result.used_timestamp.isoformat() if result.used_timestamp else None,
-            },
-        )
-        return result
-    except HTTPException:
-        raise
-    except Exception as exc:
-        logger.exception(
-            "prediction_failed",
-            extra={
-                "event": "prediction_failed",
-                "content_type": request.headers.get("content-type"),
-                "error_type": type(exc).__name__,
-            },
-        )
-        raise HTTPException(status_code=400, detail=f"Failed to run prediction: {type(exc).__name__}") from exc
+    logger.info(
+        "prediction_success",
+        extra={
+            "event": "prediction_success",
+            "asset_id": result.asset_id,
+            "risk_score": result.risk_score,
+            "severity": result.severity,
+            "content_type": request.headers.get("content-type"),
+            "used_timestamp": result.used_timestamp.isoformat() if result.used_timestamp else None,
+        },
+    )
+    return result
 
 
 @app.get(
@@ -357,17 +547,11 @@ def predict(payload: PredictionRequest, request: Request) -> PredictionResult:
     ),
     response_model=ModelMetadata,
     operation_id="model_metadata_api_v1_model_get",
+    responses={500: {"model": ErrorResponse}},
 )
 def model_metadata() -> ModelMetadata:
     """Get current model metadata (name, version, strategy, thresholds, updated_at)."""
-    try:
-        return get_model_metadata()
-    except Exception as exc:
-        logger.exception(
-            "model_metadata_failed",
-            extra={"event": "model_metadata_failed", "error_type": type(exc).__name__},
-        )
-        raise HTTPException(status_code=500, detail="Failed to fetch model metadata.") from exc
+    return get_model_metadata()
 
 
 @app.get(
@@ -384,6 +568,7 @@ def model_metadata() -> ModelMetadata:
     ),
     response_model=AlertListResponse,
     operation_id="list_alerts_api_v1_alerts_get",
+    responses={400: {"model": ErrorResponse}, 500: {"model": ErrorResponse}},
 )
 def get_alerts(
     request: Request,
@@ -427,53 +612,38 @@ def get_alerts(
     if page is not None:
         computed_offset = (int(page) - 1) * int(limit)
 
-    try:
-        # Normalize severity into enum via DTO validation (keeps endpoint slim)
-        flt = AlertFilter(
-            asset_id=asset_id,
-            severity=severity,  # type: ignore[arg-type]
-            acknowledged=acknowledged,
-            from_ts=from_ts,
-            to_ts=to_ts,
-            sort_by=sort_by,
-            sort_dir=sort_dir,
-            offset=computed_offset,
-            limit=limit,
-        )
-        resp = list_alerts(storage=storage, flt=flt)
+    # Normalize severity into enum via DTO validation (keeps endpoint slim)
+    flt = AlertFilter(
+        asset_id=asset_id,
+        severity=severity,  # type: ignore[arg-type]
+        acknowledged=acknowledged,
+        from_ts=from_ts,
+        to_ts=to_ts,
+        sort_by=sort_by,
+        sort_dir=sort_dir,
+        offset=computed_offset,
+        limit=limit,
+    )
+    resp = list_alerts(storage=storage, flt=flt)
 
-        logger.info(
-            "alerts_list_success",
-            extra={
-                "event": "alerts_list_success",
-                "asset_id": asset_id,
-                "severity": severity,
-                "acknowledged": acknowledged,
-                "from": from_ts.isoformat() if from_ts else None,
-                "to": to_ts.isoformat() if to_ts else None,
-                "sort": sort,
-                "offset": computed_offset,
-                "limit": limit,
-                "returned": len(resp.items),
-                "total": resp.total,
-                "content_type": request.headers.get("content-type"),
-            },
-        )
-        return resp
-    except HTTPException:
-        raise
-    except Exception as exc:
-        logger.exception(
-            "alerts_list_failed",
-            extra={
-                "event": "alerts_list_failed",
-                "error_type": type(exc).__name__,
-                "asset_id": asset_id,
-                "severity": severity,
-                "acknowledged": acknowledged,
-            },
-        )
-        raise HTTPException(status_code=400, detail=f"Failed to list alerts: {type(exc).__name__}") from exc
+    logger.info(
+        "alerts_list_success",
+        extra={
+            "event": "alerts_list_success",
+            "asset_id": asset_id,
+            "severity": severity,
+            "acknowledged": acknowledged,
+            "from": from_ts.isoformat() if from_ts else None,
+            "to": to_ts.isoformat() if to_ts else None,
+            "sort": sort,
+            "offset": computed_offset,
+            "limit": limit,
+            "returned": len(resp.items),
+            "total": resp.total,
+            "content_type": request.headers.get("content-type"),
+        },
+    )
+    return resp
 
 
 @app.post(
@@ -486,6 +656,7 @@ def get_alerts(
     ),
     response_model=AlertAckResponse,
     operation_id="ack_alerts_api_v1_alerts_ack_post",
+    responses={400: {"model": ErrorResponse}, 500: {"model": ErrorResponse}},
 )
 def ack_alerts(payload: AlertAckRequest, request: Request) -> AlertAckResponse:
     """Acknowledge one or more alerts.
@@ -494,31 +665,17 @@ def ack_alerts(payload: AlertAckRequest, request: Request) -> AlertAckResponse:
         AlertAckResponse: {updated, not_found}
     """
     storage = get_storage(app)
+    resp = acknowledge_alerts(storage=storage, req=payload)
 
-    try:
-        resp = acknowledge_alerts(storage=storage, req=payload)
-        logger.info(
-            "alerts_ack_success",
-            extra={
-                "event": "alerts_ack_success",
-                "ids_len": len(payload.ids),
-                "updated_len": len(resp.updated),
-                "not_found_len": len(resp.not_found),
-                "acked_by": payload.acked_by,
-                "content_type": request.headers.get("content-type"),
-            },
-        )
-        return resp
-    except HTTPException:
-        raise
-    except Exception as exc:
-        logger.exception(
-            "alerts_ack_failed",
-            extra={
-                "event": "alerts_ack_failed",
-                "error_type": type(exc).__name__,
-                "ids_len": len(payload.ids) if payload.ids else 0,
-                "content_type": request.headers.get("content-type"),
-            },
-        )
-        raise HTTPException(status_code=400, detail=f"Failed to acknowledge alerts: {type(exc).__name__}") from exc
+    logger.info(
+        "alerts_ack_success",
+        extra={
+            "event": "alerts_ack_success",
+            "ids_len": len(payload.ids),
+            "updated_len": len(resp.updated),
+            "not_found_len": len(resp.not_found),
+            "acked_by": payload.acked_by,
+            "content_type": request.headers.get("content-type"),
+        },
+    )
+    return resp

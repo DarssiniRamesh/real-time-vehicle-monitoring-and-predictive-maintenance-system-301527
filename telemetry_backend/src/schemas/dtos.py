@@ -231,3 +231,30 @@ class ModelMetadata(BaseModel):
     strategy: str = Field(..., description="Inference strategy used (e.g., rule-based).")
     thresholds: PredictionThresholds = Field(..., description="Threshold configuration used for inference.")
     updated_at: datetime = Field(..., description="UTC timestamp when this model configuration was last updated.")
+
+
+class APIError(BaseModel):
+    """Standardized error envelope payload returned by the API on failures."""
+
+    code: str = Field(..., description="Stable error code identifier (e.g., http_exception, validation_error).")
+    message: str = Field(..., description="Human-readable summary of the error.")
+    details: Any | None = Field(
+        None,
+        description="Optional structured details for debugging/validation (may be omitted in production).",
+    )
+
+
+class ErrorResponse(BaseModel):
+    """Standardized error response DTO across endpoints.
+
+    Notes:
+    - Successful response contracts are unchanged.
+    - This DTO is used by global exception handlers for consistent error payloads.
+    """
+
+    error: APIError = Field(..., description="Error object describing the failure.")
+    status_code: int = Field(..., ge=100, le=599, description="HTTP status code returned.")
+    request_id: str | None = Field(
+        None,
+        description="Correlation id for tracing the request. Also returned as X-Request-ID header.",
+    )
