@@ -45,6 +45,13 @@ class TelemetryRecordResponse(BaseModel):
     readings: dict[str, Any] = Field(..., description="Sensor readings payload.")
 
 
+class TelemetryIngestResponse(BaseModel):
+    """Response DTO for telemetry ingestion results."""
+
+    count: int = Field(..., description="Number of telemetry records inserted.")
+    ids: list[int] = Field(..., description="Database ids of inserted telemetry records, in insert order.")
+
+
 class AlertCreateRequest(BaseModel):
     """Request DTO for creating an alert.
 
