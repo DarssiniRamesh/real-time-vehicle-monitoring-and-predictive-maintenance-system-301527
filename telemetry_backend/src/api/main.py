@@ -6,7 +6,8 @@ from typing import Any
 from fastapi import Body, FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 
-from src.schemas.dtos import TelemetryIngestResponse
+from src.schemas.dtos import ModelMetadata, PredictionRequest, PredictionResult, TelemetryIngestResponse
+from src.services.prediction import get_model_metadata, predict_for_asset, predict_from_readings
 from src.services.telemetry_ingest import ingest_telemetry_from_csv_upload, ingest_telemetry_from_json
 from src.storage.adapter import StorageAdapter
 from src.storage.factory import create_storage_adapter
@@ -16,6 +17,7 @@ logger = logging.getLogger("telemetry_backend")
 openapi_tags = [
     {"name": "Health", "description": "Service health and operational checks."},
     {"name": "Telemetry", "description": "Telemetry ingestion and time-series record management."},
+    {"name": "Prediction", "description": "Baseline rule-based inference and model diagnostics."},
 ]
 
 
@@ -133,3 +135,94 @@ def ingest_telemetry(
             },
         )
         raise HTTPException(status_code=400, detail=f"Failed to ingest telemetry: {type(exc).__name__}") from exc
+
+
+@app.post(
+    "/api/v1/predict",
+    tags=["Prediction"],
+    summary="Baseline failure-risk prediction (rule-based)",
+    description=(
+        "Compute a baseline failure risk score using a simple rule-based threshold strategy.\n\n"
+        "Request options:\n"
+        "A) Provide `readings` (and optionally `asset_id`, `timestamp`) to run inference directly.\n"
+        "B) Provide `asset_id` only to fetch the most recent telemetry from storage and infer.\n\n"
+        "Returns a PredictionResult: {risk_score (0-1), severity, recommendation}."
+    ),
+    response_model=PredictionResult,
+    operation_id="predict_api_v1_predict_post",
+)
+def predict(payload: PredictionRequest, request: Request) -> PredictionResult:
+    """Run baseline rule-based inference.
+
+    Input validation rules:
+    - Must provide either `readings` OR `asset_id`.
+    - If `readings` is provided, `asset_id` is required to scope the result.
+
+    Returns:
+        PredictionResult DTO.
+    """
+    storage = get_storage(app)
+
+    try:
+        if payload.readings is not None:
+            if payload.asset_id is None or payload.asset_id.strip() == "":
+                raise HTTPException(status_code=400, detail="asset_id is required when readings are provided.")
+            if not isinstance(payload.readings, dict) or len(payload.readings) == 0:
+                raise HTTPException(status_code=400, detail="readings must be a non-empty object.")
+            result = predict_from_readings(asset_id=payload.asset_id, readings=payload.readings)
+            # preserve provided timestamp if present
+            if payload.timestamp is not None:
+                result.used_timestamp = payload.timestamp  # type: ignore[attr-defined]
+        else:
+            if payload.asset_id is None or payload.asset_id.strip() == "":
+                raise HTTPException(status_code=400, detail="Provide either readings or asset_id.")
+            result = predict_for_asset(storage=storage, asset_id=payload.asset_id)
+
+        logger.info(
+            "prediction_success",
+            extra={
+                "event": "prediction_success",
+                "asset_id": result.asset_id,
+                "risk_score": result.risk_score,
+                "severity": result.severity,
+                "content_type": request.headers.get("content-type"),
+                "used_timestamp": result.used_timestamp.isoformat() if result.used_timestamp else None,
+            },
+        )
+        return result
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception(
+            "prediction_failed",
+            extra={
+                "event": "prediction_failed",
+                "content_type": request.headers.get("content-type"),
+                "error_type": type(exc).__name__,
+            },
+        )
+        raise HTTPException(status_code=400, detail=f"Failed to run prediction: {type(exc).__name__}") from exc
+
+
+@app.get(
+    "/api/v1/model",
+    tags=["Prediction"],
+    summary="Model diagnostics/metadata (rule-based)",
+    description=(
+        "Return metadata about the currently active prediction strategy.\n\n"
+        "For this POC the strategy is deterministic and rule-based; this endpoint mirrors\n"
+        "a typical ML model registry 'active model' descriptor."
+    ),
+    response_model=ModelMetadata,
+    operation_id="model_metadata_api_v1_model_get",
+)
+def model_metadata() -> ModelMetadata:
+    """Get current model metadata (name, version, strategy, thresholds, updated_at)."""
+    try:
+        return get_model_metadata()
+    except Exception as exc:
+        logger.exception(
+            "model_metadata_failed",
+            extra={"event": "model_metadata_failed", "error_type": type(exc).__name__},
+        )
+        raise HTTPException(status_code=500, detail="Failed to fetch model metadata.") from exc
