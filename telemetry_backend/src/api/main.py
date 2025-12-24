@@ -124,7 +124,11 @@ app = FastAPI(
 # middleware echoes the request Origin (instead of '*'), which works with credentials.
 default_origins = ["http://localhost:3000", "http://127.0.0.1:3000"]
 cors_allow_origins = _parse_cors_origins(os.getenv("CORS_ALLOW_ORIGINS")) or default_origins
-cors_allow_origin_regex = os.getenv("CORS_ALLOW_ORIGIN_REGEX", ".*")
+
+# SECURITY NOTE:
+# Do not default to allow-all origin regex. If you need to allow multiple dynamic origins
+# (e.g., preview deployments), set CORS_ALLOW_ORIGIN_REGEX explicitly.
+cors_allow_origin_regex = os.getenv("CORS_ALLOW_ORIGIN_REGEX")
 
 app.add_middleware(
     CORSMiddleware,
